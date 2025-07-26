@@ -1,82 +1,91 @@
-import requests
+
 import os
+import requests
 import time
+from flask import Flask
 
-BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-INTERVAL = 900  # 15 دقيقة = 900 ثانية
+app = Flask(__name__)
 
-def send_telegram_alert(symbol, reason):
-    message = f"🚨 إشارة شراء على {symbol}\nالسبب: {reason}"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+COINEX_API = "https://api.coinex.com/v1/market/kline"
+
+def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message}
     try:
         requests.post(url, json=payload)
-    except:
-        pass
+    except Exception as e:
+        print(f"Telegram Error: {e}")
 
-def get_symbols():
+def fetch_klines(market):
+    params = {
+        "market": market,
+        "type": "15min",
+        "limit": 30
+    }
     try:
-        res = requests.get("https://api.coinex.com/v1/market/list")
-        data = res.json()
-        return [s for s in data["data"] if s.endswith("USDT")]
-    except:
-        return []
-
-def get_klines(symbol):
-    url = f"https://api.coinex.com/v1/market/kline?market={symbol}&type=15min&limit=25"
-    try:
-        res = requests.get(url)
-        return res.json()["data"]
+        res = requests.get(COINEX_API, params=params).json()
+        return res["data"]["klines"]
     except:
         return []
 
 def check_fake_breakout(candles):
-    lows = [c[3] for c in candles[-20:]]
-    support = min(lows)
-    broke_below = candles[-1][3] < support
-    closed_above = candles[-1][2] > support
-    return broke_below and closed_above
+    lows = [float(c.split(',')[3]) for c in candles]
+    closes = [float(c.split(',')[4]) for c in candles]
+    support = min(lows[:-1])
+    return float(candles[-1].split(',')[3]) < support and float(candles[-1].split(',')[4]) > support
 
 def check_compression_breakout(candles):
-    highs = [c[1] for c in candles[-20:]]
-    lows = [c[3] for c in candles[-20:]]
+    highs = [float(c.split(',')[2]) for c in candles]
+    lows = [float(c.split(',')[3]) for c in candles]
+    closes = [float(c.split(',')[4]) for c in candles]
+    opens = [float(c.split(',')[1]) for c in candles]
+    vols = [float(c.split(',')[5]) for c in candles]
+
     price_range = max(highs) - min(lows)
     is_tight = price_range / min(lows) < 0.01
-    breakout = candles[-1][2] > max(highs[:-1])
-    green = candles[-1][2] > candles[-1][1]
-    volumes = [c[5] for c in candles[-20:]]
-    vol_check = candles[-1][5] > sum(volumes)/len(volumes)
-    return is_tight and breakout and green and vol_check
+    breakout = closes[-1] > max(highs[:-1])
+    bullish = closes[-1] > opens[-1]
+    vol_ok = vols[-1] > sum(vols) / len(vols)
+
+    return is_tight and breakout and bullish and vol_ok
 
 def check_time_gap_breakout(candles):
     from datetime import datetime
-    timestamp = candles[-1][0]
-    hour = datetime.utcfromtimestamp(timestamp).hour
-    if hour not in [10, 14]: return False
-    highs = [c[1] for c in candles[-21:-1]]
-    prev_high = max(highs)
-    breakout = candles[-1][2] > prev_high
-    green = candles[-1][2] > candles[-1][1]
-    volumes = [c[5] for c in candles[-20:]]
-    vol_check = candles[-1][5] > sum(volumes)/len(volumes)
-    return breakout and green and vol_check
+    now = datetime.utcnow()
+    if now.hour != 10 and now.hour != 14:
+        return False
+
+    highs = [float(c.split(',')[2]) for c in candles]
+    closes = [float(c.split(',')[4]) for c in candles]
+    opens = [float(c.split(',')[1]) for c in candles]
+    vols = [float(c.split(',')[5]) for c in candles]
+
+    prev_high = max(highs[:-1])
+    return closes[-1] > prev_high and closes[-1] > opens[-1] and vols[-1] > sum(vols) / len(vols)
 
 def main():
-    while True:
-        symbols = get_symbols()
-        for sym in symbols:
-            candles = get_klines(sym)
-            if len(candles) < 21:
-                continue
-            if check_fake_breakout(candles):
-                send_telegram_alert(sym, "كسر كاذب")
-            elif check_compression_breakout(candles):
-                send_telegram_alert(sym, "ضغط + شمعة")
-            elif check_time_gap_breakout(candles):
-                send_telegram_alert(sym, "فجوة زمنية")
-            time.sleep(1)
-        time.sleep(60)
+    market_list_url = "https://api.coinex.com/v1/market/list"
+    res = requests.get(market_list_url).json()
+    usdt_pairs = [pair for pair in res["data"] if pair.endswith("USDT")]
 
-if __name__ == "__main__":
-    main()
+    for pair in usdt_pairs:
+        candles = fetch_klines(pair)
+        if len(candles) < 20:
+            continue
+
+        if check_fake_breakout(candles) or check_compression_breakout(candles) or check_time_gap_breakout(candles):
+            send_telegram_alert(f"🚨 Buy Signal on {pair}")
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+if __name__ == '__main__':
+    while True:
+        try:
+            main()
+        except Exception as e:
+            print(f"Error: {e}")
+        time.sleep(300)

@@ -1,12 +1,7 @@
+
 services:
   - type: web
-    name: trading-bot-auto
+    name: tradingview-bot
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
-    autoDeploy: true
-    envVars:
-      - key: TELEGRAM_TOKEN
-        sync: false
-      - key: TELEGRAM_CHAT_ID
-        sync: false
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
