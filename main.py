@@ -1,72 +1,102 @@
-import requests
 import time
-import os
+import requests
+import hmac
+import hashlib
+import base64
+import json
 from datetime import datetime
+import threading
+
+# ========== الإعدادات ==========
+TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN"
+TELEGRAM_CHAT_ID = "YOUR_CHAT_ID"
 
 COINEX_API_URL = "https://api.coinex.com/v1/market/ticker/all"
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+INTERVAL_SECONDS = 300  # كل 5 دقائق
 
 LOOKBACK = 20
-CHECK_INTERVAL = 60  # seconds
 
-def fetch_data():
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
-        response = requests.get(COINEX_API_URL)
-        return response.json()["data"]["ticker"]
-    except:
+        requests.post(url, data=data)
+    except Exception as e:
+        print(f"Telegram Error: {e}")
+
+def fetch_market_data():
+    try:
+        res = requests.get(COINEX_API_URL)
+        data = res.json()
+        return data["data"]["ticker"]
+    except Exception as e:
+        print(f"API Error: {e}")
         return {}
 
-def fake_breakout(data):
-    lows = [float(c["low"]) for c in data]
+def check_fake_breakout(candles):
+    lows = [float(c["low"]) for c in candles]
+    closes = [float(c["close"]) for c in candles]
+    current_low = lows[-1]
+    current_close = closes[-1]
     support = min(lows[-LOOKBACK:])
-    return float(data[-1]["low"]) < support and float(data[-1]["close"]) > support
+    return current_low < support and current_close > support
 
-def compression_breakout(data):
-    highs = [float(c["high"]) for c in data]
-    lows = [float(c["low"]) for c in data]
+def check_compression_breakout(candles):
+    highs = [float(c["high"]) for c in candles]
+    lows = [float(c["low"]) for c in candles]
+    closes = [float(c["close"]) for c in candles]
+    opens = [float(c["open"]) for c in candles]
+    volumes = [float(c["volume"]) for c in candles]
+    current_close = closes[-1]
+    current_open = opens[-1]
     price_range = max(highs[-LOOKBACK:]) - min(lows[-LOOKBACK:])
-    tight = price_range / min(lows[-LOOKBACK:]) < 0.01
-    breakout = float(data[-1]["close"]) > max(highs[-LOOKBACK-1:-1])
-    return tight and breakout and float(data[-1]["close"]) > float(data[-1]["open"])
+    is_tight = price_range / min(lows[-LOOKBACK:]) < 0.01
+    breakout = current_close > max(highs[-LOOKBACK:-1])
+    avg_volume = sum(volumes[-LOOKBACK:]) / LOOKBACK
+    return is_tight and breakout and current_close > current_open and volumes[-1] > avg_volume
 
-def time_condition():
-    hour = datetime.utcnow().hour + 3  # UTC+3
-    return hour in [10, 14]
-
-def time_gap_entry(data):
-    highs = [float(c["high"]) for c in data]
+def check_price_gap_entry(candles):
+    hours_to_check = [10, 14]
+    now = datetime.utcnow()
+    current_hour = now.hour
+    if current_hour not in hours_to_check:
+        return False
+    highs = [float(c["high"]) for c in candles]
+    closes = [float(c["close"]) for c in candles]
+    opens = [float(c["open"]) for c in candles]
+    volumes = [float(c["volume"]) for c in candles]
     prev_high = max(highs[-LOOKBACK-1:-1])
-    breakout = float(data[-1]["close"]) > prev_high
-    return breakout and time_condition() and float(data[-1]["close"]) > float(data[-1]["open"])
+    breakout = closes[-1] > prev_high
+    avg_volume = sum(volumes[-LOOKBACK:]) / LOOKBACK
+    return breakout and closes[-1] > opens[-1] and volumes[-1] > avg_volume
 
-def send_alert(symbol, reason):
-    msg = f"🚨 فرصة على {symbol}\nالسبب: {reason}"
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
-    requests.post(url, data=data)
+def get_klines(symbol):
+    url = f"https://api.coinex.com/v1/market/kline?market={symbol}&type=15min&limit={LOOKBACK+1}"
+    try:
+        res = requests.get(url)
+        candles = res.json()["data"]
+        return [{"open": i[1], "high": i[3], "low": i[4], "close": i[2], "volume": i[5]} for i in candles]
+    except:
+        return []
 
-def main():
-    print("Bot started...")
+def run_bot():
     while True:
-        tickers = fetch_data()
-        for symbol, info in tickers.items():
+        print("Scanning...")
+        data = fetch_market_data()
+        for symbol in data:
             if not symbol.endswith("USDT"):
                 continue
-            try:
-                klines_url = f"https://api.coinex.com/v1/market/kline?market={symbol}&type=15min&limit=LOOKBACK"
-                res = requests.get(klines_url).json()
-                candles = [{"open": x[1], "high": x[3], "low": x[4], "close": x[2]} for x in res["data"]]
-
-                if fake_breakout(candles):
-                    send_alert(symbol, "كسر كاذب")
-                elif compression_breakout(candles):
-                    send_alert(symbol, "ضغط + شمعة")
-                elif time_gap_entry(candles):
-                    send_alert(symbol, "فجوة زمنية")
-            except:
+            candles = get_klines(symbol)
+            if len(candles) < LOOKBACK + 1:
                 continue
-        time.sleep(CHECK_INTERVAL)
+            if (
+                check_fake_breakout(candles)
+                or check_compression_breakout(candles)
+                or check_price_gap_entry(candles)
+            ):
+                send_telegram_message(f"📢 فرصة على: {symbol}")
+                time.sleep(1)
+        time.sleep(INTERVAL_SECONDS)
 
 if __name__ == "__main__":
-    main()
+    run_bot()
